@@ -1,10 +1,14 @@
 //============================================================================
 // Z8530 SCC (Serial Communications Controller) - Synthesizable Verilog Model
 //
-// Design rev: 1.0  (2026-06-26)  -- Tests 1-21 PASS
+// Design rev: 1.1  (2026-07-10)  -- Tests 1-22 PASS
 //   Feature params: SOFT_RESET_EN, RR8_CTRL_POP, BRG_SRC_A/B,
-//     UNIPLUS_BAUD_PATCH_B, AUTO_ENABLES_EN, RTXC_XTAL_FULLRATE_A/B
+//     UNIPLUS_BAUD_PATCH_B, AUTO_ENABLES_EN, RTXC_XTAL_FULLRATE_A/B,
+//     RDWR_RESET_EN
 //   Rev history:
+//     1.1 - Hardware reset via simultaneous /RD+/WR while selected
+//           (RDWR_RESET_EN, needs SOFT_RESET_EN) -> fires the WR9=0xC0
+//           force-reset machinery. Verified by Test 22.
 //     1.0 - First fully verified baseline (Tests 1-21 pass). Adds /SYNCA//SYNCB
 //           pins -> RR0[4] (status only), RTxC-XTAL full-rate override
 //           (RTXC_XTAL_FULLRATE_A/B), and x32/x64 clock modes (sample counters
@@ -74,7 +78,15 @@ module z8530_scc #(
     //   rate is sclk/ClockMode. Set to 0 to compile the override out (that WR11
     //   encoding then selects the RTxC pin, which is tied off -> dead engine).
     parameter RTXC_XTAL_FULLRATE_A = 1,
-    parameter RTXC_XTAL_FULLRATE_B = 1
+    parameter RTXC_XTAL_FULLRATE_B = 1,
+    // Hardware reset via simultaneous /RD + /WR (the real Z8530 has no reset
+    // pin; driving both strobes low while selected is the datasheet hardware
+    // reset, equivalent to WR9 = 0xC0). When 1, that bus combination fires the
+    // same force-hardware-reset machinery as the WR9 command. Requires
+    // SOFT_RESET_EN=1 (shares its stretch/CDC logic); set to 0 to compile the
+    // detector out (the combination then behaves as a simultaneous read+write,
+    // as before this feature).
+    parameter RDWR_RESET_EN = 1
 ) (
     // System Interface
     input  wire        clk,           // CPU/bus clock (register file, interrupts, RR mux)
@@ -334,6 +346,22 @@ wire force_hw_cmd  = wr9_write_evt && (data_in[7:6] == 2'b11);
 wire chreset_a_cmd = wr9_write_evt && (data_in[7:6] == 2'b10);
 wire chreset_b_cmd = wr9_write_evt && (data_in[7:6] == 2'b01);
 
+// Simultaneous /RD + /WR while selected = hardware reset (real Z8530 has no
+// reset pin; this otherwise-illegal bus combination is the datasheet hardware
+// reset, equivalent to WR9=0xC0). Registered once to deglitch. Retriggers
+// every cycle the combination is held, so the reset window extends RST_STRETCH
+// past deassertion. Any spurious register/FIFO write from the same bus cycle
+// is wiped by the reset override (see §5.1 note: writes during a reset window
+// are ignored). Shares the SOFT_RESET_EN machinery, so it requires it.
+reg rdwr_rst_det;
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) rdwr_rst_det <= 1'b0;
+    else          rdwr_rst_det <= (RDWR_RESET_EN != 0) && (SOFT_RESET_EN != 0) &&
+                                  chip_sel && !rd_n && !wr_n;
+end
+
+wire force_hw_evt = force_hw_cmd || rdwr_rst_det;
+
 reg [6:0] rst_a_cnt, rst_b_cnt, force_cnt;
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -341,13 +369,13 @@ always @(posedge clk or negedge reset_n) begin
         rst_b_cnt <= 7'd0;
         force_cnt <= 7'd0;
     end else begin
-        if (chreset_a_cmd || force_hw_cmd) rst_a_cnt <= RST_STRETCH;
+        if (chreset_a_cmd || force_hw_evt) rst_a_cnt <= RST_STRETCH;
         else if (rst_a_cnt != 0)           rst_a_cnt <= rst_a_cnt - 1'b1;
 
-        if (chreset_b_cmd || force_hw_cmd) rst_b_cnt <= RST_STRETCH;
+        if (chreset_b_cmd || force_hw_evt) rst_b_cnt <= RST_STRETCH;
         else if (rst_b_cnt != 0)           rst_b_cnt <= rst_b_cnt - 1'b1;
 
-        if (force_hw_cmd)                  force_cnt <= RST_STRETCH;
+        if (force_hw_evt)                  force_cnt <= RST_STRETCH;
         else if (force_cnt != 0)           force_cnt <= force_cnt - 1'b1;
     end
 end

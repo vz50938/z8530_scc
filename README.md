@@ -154,6 +154,18 @@ Each command drives a per-channel soft reset (`rst_a_clk`/`rst_b_clk`, plus
 async FIFO** are held in reset with overlap. The clk-side hold is long enough to
 contain the full sclk-side reset window.
 
+**Hardware reset via simultaneous /RD + /WR** — the real Z8530 has no reset
+pin; the datasheet defines driving both strobes low while selected as a
+hardware reset (equivalent to WR9 = `0xC0`). **Parameter `RDWR_RESET_EN`
+(default 1)** implements this: `cs_n=0, rd_n=0, wr_n=0` (registered once to
+deglitch) fires the same force-hardware-reset machinery as the WR9 command.
+It retriggers while the combination is held, so the reset window extends
+`RST_STRETCH` past deassertion. Any spurious register/FIFO write from the same
+bus cycle is wiped by the reset override (writes during a reset window are
+ignored — see below). Requires `SOFT_RESET_EN=1` (shares its stretch/CDC
+logic); with `RDWR_RESET_EN=0` the combination behaves as a simultaneous
+read+write, as before.
+
 **Parameter `SOFT_RESET_EN` (default 1)**: set to 0 to compile out the soft-reset
 logic. When disabled, the WR9[7:6] command decode is forced inactive, so the
 stretch counters never load, `rst_*` stay 0, and all reset overrides / CDC
@@ -324,11 +336,14 @@ channel's TX/RX clock-enable (`tx_clk_*_s`/`rx_clk_*_s`) is forced active every
 | 19 | /SYNC pins: /SYNCA/B level reflected in RR0[4] (Sync/Hunt) on each channel; status only — a /SYNC edge raises no interrupt even with WR15[4]+MIE |
 | 20 | x32 / x64 clock-mode loopback (Ch A): WR4[7:6]=10/11 round-trip a byte, exercising the widened sample counters (reach 31/63) |
 | 21 | RTxC-from-XTAL full-rate override (WR11=0x80, RTXC_XTAL_FULLRATE_A) loopback on Ch A — byte round-trips with the engine clocked every sclk cycle |
+| 22 | Hardware reset via simultaneous /RD+/WR (RDWR_RESET_EN): programmed registers on both channels read back cleared, /INT deasserts, then a post-reset Ch A loopback proves the FIFOs/CDC recovered |
 
 (Test 11 — external x1 clock — was removed; external clock pins are tied off.)
 
 Not exercised by the TB: parity round-trip, 2-stop-bit framing,
-5/6/7-bit characters, RX overrun recovery, WR9 reset commands.
+5/6/7-bit characters, RX overrun recovery, WR9 per-channel reset commands
+(the shared force-reset machinery is exercised indirectly by Test 22's
+/RD+/WR reset, but not the WR9 write path itself nor channel isolation).
 
 ---
 

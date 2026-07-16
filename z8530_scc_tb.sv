@@ -1941,6 +1941,128 @@ initial begin
     end
 
     //------------------------------------------------------------------------
+    // Test 22: hardware reset via simultaneous /RD + /WR (RDWR_RESET_EN)
+    //   The real Z8530 has no reset pin; driving /RD and /WR low together
+    //   while selected is the datasheet hardware reset (= WR9 0xC0). Checks:
+    //   A) Registers programmed on both channels read back cleared afterwards
+    //      (RR12/RR13 -> 0), /INT deasserted, RR0 back to idle shape.
+    //   B) The device still works after the reset: reconfigure Channel A and
+    //      loop back one byte (proves FIFOs/CDC came out of reset cleanly).
+    //------------------------------------------------------------------------
+    $display("\n[%0t] Test 22: /RD+/WR simultaneous hardware reset", $time);
+
+    begin : rdwr_reset_test
+        integer errs;
+        integer w;
+        reg [7:0] rb;
+        reg       got;
+        errs = 0;
+
+        // Program recognizable state on both channels + MIE
+        write_ctrl(1, 4'd12, 8'h5A);
+        write_ctrl(1, 4'd13, 8'h3C);
+        write_ctrl(0, 4'd12, 8'h77);
+        write_ctrl(1, 4'd9,  8'h08);   // MIE
+        read_ctrl(1, 4'd12, rb);
+        if (rb !== 8'h5A) begin
+            $display("[%0t]   FAIL: precondition, RR12(A)=%02h exp 5A", $time, rb);
+            errs = errs + 1;
+        end
+
+        // ---- The illegal combination: /RD + /WR both low through a normal
+        //      2-5-2 bus cycle (pointer is at 0, data 0x00 -> null WR0 cmd,
+        //      wiped by the reset window anyway) ----
+        @(posedge clk);
+        a_b     <= 1'b1;
+        d_c     <= 1'b0;
+        data_in <= 8'h00;
+        wr_n    <= 1'b0;
+        rd_n    <= 1'b0;               // both strobes low
+        cs_n    <= 1'b1;
+        repeat(2) @(posedge clk);
+        cs_n    <= 1'b0;               // selected: reset condition detected
+        repeat(5) @(posedge clk);
+        cs_n    <= 1'b1;
+        repeat(2) @(posedge clk);
+        wr_n    <= 1'b1;
+        rd_n    <= 1'b1;
+        @(posedge clk);
+        $display("[%0t]   /RD+/WR cycle issued", $time);
+
+        // Reset window is RST_STRETCH (96 clk ~ 4.8 us) + sclk CDC tail; writes
+        // during it are ignored, so wait well past it before touching the chip.
+        repeat(2500) @(posedge clk);
+
+        // ---- Sub-test A: state cleared ----
+        read_ctrl(1, 4'd12, rb);
+        if (rb === 8'h00)
+            $display("[%0t]   RR12(A) cleared PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: RR12(A)=%02h exp 00", $time, rb);
+            errs = errs + 1;
+        end
+        read_ctrl(1, 4'd13, rb);
+        if (rb === 8'h00)
+            $display("[%0t]   RR13(A) cleared PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: RR13(A)=%02h exp 00", $time, rb);
+            errs = errs + 1;
+        end
+        read_ctrl(0, 4'd12, rb);
+        if (rb === 8'h00)
+            $display("[%0t]   RR12(B) cleared PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: RR12(B)=%02h exp 00", $time, rb);
+            errs = errs + 1;
+        end
+        if (int_n == 1'b1)
+            $display("[%0t]   /INT deasserted PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: /INT asserted after reset", $time);
+            errs = errs + 1;
+        end
+        read_ctrl(1, 4'd0, rb);
+        if (rb[2] == 1'b1 && rb[0] == 1'b0)
+            $display("[%0t]   RR0 idle shape PASS (%02h)", $time, rb);
+        else begin
+            $display("[%0t]   FAIL: RR0=%02h (exp bit2=1, bit0=0)", $time, rb);
+            errs = errs + 1;
+        end
+
+        // ---- Sub-test B: functional after reset (Ch A loopback) ----
+        $display("[%0t] B: post-reset loopback", $time);
+        write_ctrl(1, 4'd4,  8'h44);   // x16, 1 stop, no parity
+        write_ctrl(1, 4'd3,  8'hC1);   // RX 8 bits, RX enable
+        write_ctrl(1, 4'd5,  8'h6A);   // TX 8 bits, TX enable, RTS
+        write_ctrl(1, 4'd12, 8'h01);   // TC = 1
+        write_ctrl(1, 4'd13, 8'h00);
+        write_ctrl(1, 4'd11, 8'h50);   // TX/RX clocks from BRG
+        write_ctrl(1, 4'd14, 8'h11);   // BRG enable + loopback
+        repeat(100) @(posedge clk);
+
+        write_data(1, 8'hA7);
+        got = 1'b0;
+        for (w = 0; w < 80 && !got; w = w + 1) begin
+            repeat(1000) @(posedge clk);
+            read_ctrl(1, 4'd0, read_val);
+            if (read_val[0]) begin read_data(1, rb); got = 1'b1; end
+        end
+        if (got && rb == 8'hA7)
+            $display("[%0t]   Post-reset loopback PASS (%02h)", $time, rb);
+        else begin
+            $display("[%0t]   FAIL: post-reset loopback (got=%b rb=%02h exp A7)", $time, got, rb);
+            errs = errs + 1;
+        end
+
+        // Cleanup
+        write_ctrl(1, 4'd14, 8'h01);   // loopback off, BRG on
+        repeat(50) @(posedge clk);
+
+        if (errs == 0) $display("[%0t] RDWR RESET TEST PASS", $time);
+        else           $display("[%0t] RDWR RESET TEST FAIL: %0d errors", $time, errs);
+    end
+
+    //------------------------------------------------------------------------
     $display("\n===========================================");
     $display("Z8530 SCC Testbench Complete");
     $display("===========================================");
