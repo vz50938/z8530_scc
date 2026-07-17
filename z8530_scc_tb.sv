@@ -245,6 +245,12 @@ endtask
 reg [7:0] read_val;
 integer   i;
 
+// Global check-failure tally. Every FAIL path in every test adds to this
+// (old-style tests increment directly; named-block tests fold their local
+// error count in after their summary line). The end-of-run summary reports
+// PASS only if this is 0 -- so a silently-failing test cannot slip past.
+integer   g_fail = 0;
+
 initial begin
     $display("===========================================");
     $display("Z8530 SCC Testbench - dual-clock, new bus");
@@ -329,6 +335,13 @@ initial begin
     // Test 6: Loopback - Channel A
     //------------------------------------------------------------------------
     $display("\n[%0t] Test 6: Loopback Mode on Channel A", $time);
+    // Flush the stale 0x55 that Test 2 queued into the TX FIFO with no clock:
+    // once the BRG starts below it would transmit first and corrupt the
+    // loopback sequence (and leave a byte lingering into Test 8). Channel
+    // Reset A clears channel A's TX/RX FIFOs, FSMs and registers; the writes
+    // below reconfigure from scratch.
+    write_ctrl(1, 4'd9, 8'h80);   // WR9[7:6]=10 -> Channel Reset A
+    repeat(250) @(posedge clk);   // let the reset window (RST_STRETCH + CDC) close
     write_ctrl(1, 4'd4, 8'h44);   // x16, 1 stop, no parity
     write_ctrl(1, 4'd3, 8'hC1);   // RX 8 bits, RX enable
     write_ctrl(1, 4'd5, 8'h6A);   // TX 8 bits, TX enable, RTS
@@ -347,10 +360,14 @@ initial begin
         read_data(1, read_val);
         if (read_val == 8'hA5)
             $display("[%0t] LOOPBACK PASS: Received 0x%02h", $time, read_val);
-        else
+        else begin
             $display("[%0t] LOOPBACK FAIL: Received 0x%02h (expected 0xA5)", $time, read_val);
-    end else
+            g_fail = g_fail + 1;
+        end
+    end else begin
         $display("[%0t] LOOPBACK FAIL: No data received", $time);
+        g_fail = g_fail + 1;
+    end
 
     write_data(1, 8'h5A);
     $display("[%0t] Sent 0x5A via TX (loopback)", $time);
@@ -360,10 +377,18 @@ initial begin
         read_data(1, read_val);
         if (read_val == 8'h5A)
             $display("[%0t] LOOPBACK PASS: Received 0x%02h", $time, read_val);
-        else
+        else begin
             $display("[%0t] LOOPBACK FAIL: Received 0x%02h (expected 0x5A)", $time, read_val);
-    end else
+            g_fail = g_fail + 1;
+        end
+    end else begin
         $display("[%0t] LOOPBACK FAIL: No data received", $time);
+        g_fail = g_fail + 1;
+    end
+
+    // Drain any lingering RX so nothing bleeds into Test 8
+    read_ctrl(1, 4'd0, read_val);
+    while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
 
     write_ctrl(1, 4'd14, 8'h01);   // Loopback off, BRG still on
     $display("[%0t] Loopback disabled", $time);
@@ -389,10 +414,14 @@ initial begin
         read_data(0, read_val);
         if (read_val == 8'h3C)
             $display("[%0t] CH-B LOOPBACK PASS: Received 0x%02h", $time, read_val);
-        else
+        else begin
             $display("[%0t] CH-B LOOPBACK FAIL: Received 0x%02h (expected 0x3C)", $time, read_val);
-    end else
+            g_fail = g_fail + 1;
+        end
+    end else begin
         $display("[%0t] CH-B LOOPBACK FAIL: No data received", $time);
+        g_fail = g_fail + 1;
+    end
 
     write_ctrl(0, 4'd14, 8'h00);   // Disable BRG and loopback
     write_ctrl(0, 4'd3, 8'hC0);    // Disable RX
@@ -424,9 +453,15 @@ initial begin
     read_ctrl(1, 4'd3, read_val);
     $display("[%0t] RR3 after loopback = %02h, INT_N=%b", $time, read_val, int_n);
     if (read_val[5]) $display("[%0t] RX int pending (bit 5 set) PASS", $time);
-    else             $display("[%0t] RX int NOT pending (RR3=%02h)", $time, read_val);
+    else begin
+        $display("[%0t] RX int NOT pending FAIL (RR3=%02h)", $time, read_val);
+        g_fail = g_fail + 1;
+    end
     if (read_val[4]) $display("[%0t] TX int pending (bit 4 set) PASS", $time);
-    else             $display("[%0t] TX int NOT pending (RR3=%02h)", $time, read_val);
+    else begin
+        $display("[%0t] TX int NOT pending FAIL (RR3=%02h)", $time, read_val);
+        g_fail = g_fail + 1;
+    end
 
     write_ctrl(1, 4'd0, 8'h28);    // Reset TX int pending
     $display("[%0t] WR0 = 0x28 (Reset TX int pending)", $time);
@@ -437,11 +472,29 @@ initial begin
     read_ctrl(1, 4'd0, read_val);
     if (read_val[0]) begin
         read_data(1, read_val);
-        $display("[%0t] Read RX data 0x%02h", $time, read_val);
+        if (read_val == 8'hBB)
+            $display("[%0t] Read RX data 0x%02h PASS", $time, read_val);
+        else begin
+            $display("[%0t] Read RX data 0x%02h FAIL (expected BB)", $time, read_val);
+            g_fail = g_fail + 1;
+        end
+    end else begin
+        $display("[%0t] RX data FAIL: nothing to read (expected BB)", $time);
+        g_fail = g_fail + 1;
     end
 
+    // Check Channel A's IP bits (RR3[5:3] = Rx/Tx/Ext) are clear after servicing.
+    // Bit 1 (Ch B Tx IP) may legitimately be set here -- Channel B transmitted in
+    // Test 7 and its IP latches regardless of enable (see IP/IE separation), and
+    // it is never cleared. Test 14 likewise treats RR3=0x02 as the clean baseline,
+    // so this test only asserts on Channel A's own interrupt bits.
     read_ctrl(1, 4'd3, read_val);
-    $display("[%0t] RR3 after reading data = %02h (should be 0)", $time, read_val);
+    if ((read_val & 8'h38) == 8'h00)
+        $display("[%0t] RR3 Ch A IP clear after service = %02h PASS", $time, read_val);
+    else begin
+        $display("[%0t] RR3 after reading data = %02h FAIL (Ch A IP[5:3] should be 0)", $time, read_val);
+        g_fail = g_fail + 1;
+    end
 
     write_ctrl(1, 4'd1, 8'h00);
     write_ctrl(1, 4'd9, 8'h00);
@@ -526,6 +579,7 @@ initial begin
 
         if (errors == 0) $display("[%0t] STRESS PASS (Ch A)", $time);
         else             $display("[%0t] STRESS FAIL (Ch A): %0d errors", $time, errors);
+        g_fail = g_fail + errors;
     end
 
     write_ctrl(1, 4'd14, 8'h01);   // loopback off
@@ -608,6 +662,7 @@ initial begin
 
         if (errors_b == 0) $display("[%0t] STRESS PASS (Ch B)", $time);
         else               $display("[%0t] STRESS FAIL (Ch B): %0d errors", $time, errors_b);
+        g_fail = g_fail + errors_b;
     end
 
     write_ctrl(0, 4'd14, 8'h01);
@@ -775,6 +830,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] XON/XOFF TEST PASS", $time);
         else           $display("[%0t] XON/XOFF TEST FAIL: %0d errs", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     write_ctrl(1, 4'd14, 8'h01);   // loopback off
@@ -846,6 +902,7 @@ initial begin
         end
         if (errs_a == 0) $display("[%0t] Ch-A HELLO WORLD PASS", $time);
         else             $display("[%0t] Ch-A HELLO WORLD FAIL: %0d errs", $time, errs_a);
+        g_fail = g_fail + errs_a;
         write_ctrl(1, 4'd14, 8'h01);
 
         // -- Ch B --
@@ -900,6 +957,7 @@ initial begin
         end
         if (errs_b == 0) $display("[%0t] Ch-B HELLO WORLD PASS", $time);
         else             $display("[%0t] Ch-B HELLO WORLD FAIL: %0d errs", $time, errs_b);
+        g_fail = g_fail + errs_b;
         write_ctrl(0, 4'd14, 8'h01);
     end
 
@@ -1087,6 +1145,7 @@ initial begin
         // ---- Summary ----
         if (errs == 0) $display("[%0t] INTERRUPT TEST PASS (%0d sub-tests)", $time, 4);
         else           $display("[%0t] INTERRUPT TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1224,6 +1283,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] BREAK TEST PASS", $time);
         else           $display("[%0t] BREAK TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1370,6 +1430,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] WR0 COMMAND TEST PASS", $time);
         else           $display("[%0t] WR0 COMMAND TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1603,6 +1664,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] AUTO ENABLES TEST PASS", $time);
         else           $display("[%0t] AUTO ENABLES TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1700,6 +1762,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] AUTO ENABLES OFF TEST PASS", $time);
         else           $display("[%0t] AUTO ENABLES OFF TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1808,6 +1871,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] SYNC PIN TEST PASS", $time);
         else           $display("[%0t] SYNC PIN TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1886,6 +1950,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] CLOCK-MODE TEST PASS", $time);
         else           $display("[%0t] CLOCK-MODE TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -1938,6 +2003,7 @@ initial begin
 
         if (errs == 0) $display("[%0t] RTXC FULL-RATE TEST PASS", $time);
         else           $display("[%0t] RTXC FULL-RATE TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
@@ -2060,11 +2126,22 @@ initial begin
 
         if (errs == 0) $display("[%0t] RDWR RESET TEST PASS", $time);
         else           $display("[%0t] RDWR RESET TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
     end
 
     //------------------------------------------------------------------------
+    // Final summary. g_fail is the total number of failed checks across every
+    // test (old-style tests increment it directly; named-block tests fold in
+    // their local error counts). A single line makes the overall result
+    // unambiguous so a silently-failing test cannot be mistaken for a pass.
+    //------------------------------------------------------------------------
     $display("\n===========================================");
     $display("Z8530 SCC Testbench Complete");
+    $display("-------------------------------------------");
+    if (g_fail == 0)
+        $display("  RESULT: *** ALL CHECKS PASSED ***");
+    else
+        $display("  RESULT: *** FAIL -- %0d check(s) failed ***", g_fail);
     $display("===========================================");
     #1000;
     $finish;
