@@ -1460,8 +1460,10 @@ wire status_high = wr9_a[4];
 wire rx_int_enable_a = (wr1_a[4:3] == 2'b01) || (wr1_a[4:3] == 2'b10);
 wire rx_int_enable_b = (wr1_b[4:3] == 2'b01) || (wr1_b[4:3] == 2'b10);
 
-// Gated IP -> IE views. RR3 still shows raw IPs per datasheet; only the
-// /INT output and the vector arbiter are masked by WR1[4:3]/WR1[1]/WR1[0].
+// Gated IP -> IE views, kept for the /INT output and the vector arbiter.
+// Since an IP now only latches when its enable is set, these are equal to the
+// pending bits except in the window after software clears an enable, where a
+// latched IP legitimately survives -- turning IE off does not clear an IP.
 wire rx_int_active_a  = rx_int_pend_a  & rx_int_enable_a;
 wire tx_int_active_a  = tx_int_pend_a  & wr1_a[1];
 wire ext_int_active_a = ext_int_pend_a & wr1_a[0];
@@ -1589,41 +1591,41 @@ always @(posedge clk or negedge reset_n) begin
         tx_int_pend_b <= 1'b0;
         ext_int_pend_b <= 1'b0;
     end else begin
-        // RX int (IP): latched on FIFO empty->non-empty regardless of WR1[4:3];
-        // auto-cleared when the FIFO is fully drained.
-        // The enable (WR1[4:3]) gates only the /INT output and vector arbiter.
-        if (rx_fifo_arrive_a)
+        // RX int (IP): latched on FIFO empty->non-empty *if the enable is set*;
+        // auto-cleared when the FIFO is fully drained.  An IP requires its IE
+        // on real silicon; see the note on RR3 below.
+        if (rx_fifo_arrive_a & rx_int_enable_a)
             rx_int_pend_a <= 1'b1;
         else if (rx_fifo_rempty_a)
             rx_int_pend_a <= 1'b0;
 
-        if (rx_fifo_arrive_b)
+        if (rx_fifo_arrive_b & rx_int_enable_b)
             rx_int_pend_b <= 1'b1;
         else if (rx_fifo_rempty_b)
             rx_int_pend_b <= 1'b0;
 
-        // TX int (IP): latched on TX FSM byte-grab regardless of WR1[1];
+        // TX int (IP): latched on TX FSM byte-grab *if WR1[1] is set*;
         // cleared only by WR0 cmd 101 (Reset TX Int Pending).
         if (reset_tx_int_cmd_a)
             tx_int_pend_a <= 1'b0;
-        else if (tx_byte_grab_pulse_a)
+        else if (tx_byte_grab_pulse_a & wr1_a[1])
             tx_int_pend_a <= 1'b1;
 
         if (reset_tx_int_cmd_b)
             tx_int_pend_b <= 1'b0;
-        else if (tx_byte_grab_pulse_b)
+        else if (tx_byte_grab_pulse_b & wr1_b[1])
             tx_int_pend_b <= 1'b1;
 
-        // Ext/Status int (IP): latched on any WR15-enabled CTS/DCD edge
-        // regardless of WR1[0]; cleared only by WR0 cmd 010.
+        // Ext/Status int (IP): latched on a WR15-enabled CTS/DCD edge *if
+        // WR1[0] is set*; cleared only by WR0 cmd 010.
         if (reset_ext_int_cmd_a)
             ext_int_pend_a <= 1'b0;
-        else if (ext_int_set_a)
+        else if (ext_int_set_a & wr1_a[0])
             ext_int_pend_a <= 1'b1;
 
         if (reset_ext_int_cmd_b)
             ext_int_pend_b <= 1'b0;
-        else if (ext_int_set_b)
+        else if (ext_int_set_b & wr1_b[0])
             ext_int_pend_b <= 1'b1;
 
         // Soft-reset overrides (last assignment wins -> reset has priority).
