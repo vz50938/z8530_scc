@@ -1604,14 +1604,20 @@ always @(posedge clk or negedge reset_n) begin
         else if (rx_fifo_rempty_b)
             rx_int_pend_b <= 1'b0;
 
-        // TX int (IP): latched on TX FSM byte-grab *if WR1[1] is set*;
-        // cleared only by WR0 cmd 101 (Reset TX Int Pending).
-        if (reset_tx_int_cmd_a)
+        // TX int (IP): set when the buffer empties (the TX FSM grabs the byte)
+        // if WR1[1] is set, and cleared EITHER by WR0 cmd 101 (Reset TX Int
+        // Pending) OR by the CPU writing a new character -- the buffer is then
+        // no longer empty, so the condition that set it has gone.  A driver may
+        // rely on either; NetBSD's zstty_txint uses only the data write.
+        //
+        // The write wins a tie with the grab: if the FSM empties the buffer on
+        // the same clock the CPU refills it, the buffer ends up non-empty.
+        if (reset_tx_int_cmd_a | tx_fifo_wen_a)
             tx_int_pend_a <= 1'b0;
         else if (tx_byte_grab_pulse_a & wr1_a[1])
             tx_int_pend_a <= 1'b1;
 
-        if (reset_tx_int_cmd_b)
+        if (reset_tx_int_cmd_b | tx_fifo_wen_b)
             tx_int_pend_b <= 1'b0;
         else if (tx_byte_grab_pulse_b & wr1_b[1])
             tx_int_pend_b <= 1'b1;
