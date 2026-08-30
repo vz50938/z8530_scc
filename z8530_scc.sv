@@ -1735,13 +1735,13 @@ always @(posedge clk or negedge reset_n) begin
                     // WR2 and WR9 are chip-wide shared registers on the real
                     // Z8530: writable through either channel. Stored as the
                     // _a copies; channel-B writes land in the same regs.
-                    //@4'd2: begin wr2_a <= data_in; reg_ptr_b <= 4'd0; end
+                    4'd2: begin wr2_a <= data_in; reg_ptr_b <= 4'd0; end
                     4'd3: begin wr3_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd4: begin wr4_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd5: begin wr5_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd6: begin wr6_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd7: begin wr7_b <= data_in; reg_ptr_b <= 4'd0; end
-                    //@4'd9: begin wr9_a <= data_in; reg_ptr_b <= 4'd0; end   // shared master-int-ctrl
+                    4'd9: begin wr9_a <= data_in; reg_ptr_b <= 4'd0; end     // shared master-int-ctrl
                     4'd10: begin wr10_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd11: begin wr11_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd12: begin wr12_b <= data_in; reg_ptr_b <= 4'd0; end
