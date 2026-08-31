@@ -68,12 +68,19 @@ and are implemented as **asynchronous (Gray-pointer) FIFOs**:
 - Parity: enable (WR4[0]) + even/odd (WR4[1], **datasheet-correct polarity**)
 - Stop bits: WR4[3:2] decoded (see limitations for 1.5)
 - Local loopback (WR14[4])
-- Interrupts: RX / TX / Ext-Status, per-channel, with proper **IP/IE separation**
-  (events latch regardless of enable; enables gate only `/INT` and the vector)
+- Interrupts: RX / TX / Ext-Status, per-channel. An interrupt **pending (IP)
+  latches only when its enable is set** (RX = WR1[4:3], TX = WR1[1], Ext =
+  WR1[0]) — matching real Z8530 silicon and the NetBSD/SunOS `zs` driver family
+  (Sun2). The TX IP additionally clears when the CPU **writes a new data byte**
+  (the buffer is no longer empty), not only via WR0 cmd 101 (Reset TX Int
+  Pending). RR3 therefore shows the gated IPs; enables also mask `/INT` and the
+  vector. (Rev ≤ 1.1 latched IPs regardless of enable — changed in rev 1.2.)
 - Interrupt vector: RR2 read via Channel A is always the raw WR2 base; RR2 read
   via Channel B is always status-modified (per datasheet, independent of
   WR9[0] VIS). Status-High-Low select via WR9[4]
-- WR2 and WR9 treated as **chip-wide shared** registers (writable via either channel)
+- WR2 and WR9 treated as **chip-wide shared** registers, writable via **either
+  channel** (the Channel B write path was enabled in rev 1.2 — Sun2's driver
+  programs MIE/vector through Channel B; rev ≤ 1.1 accepted them via Channel A only)
 - Modem control: RTS (WR5[1]), DTR (WR5[7]); status CTS/DCD in RR0, plus the
   `/SYNC` pin level in RR0[4] (Sync/Hunt — async-mode status input only)
 - **Auto Enables (WR3[5])**: /CTS gates the transmitter and /DCD gates the
@@ -127,7 +134,7 @@ CDC is per channel — Channel A flops live in `sclk_a` and Channel B in
 | RR0 | yes | RX avail, TX empty(=not full), CTS, DCD, Sync/Hunt (bit 4 = /SYNC pin level, async-mode status only), TX underrun, Break/Abort |
 | RR1 | partial | overrun, parity err, All-Sent; framing/residue/EOF unimplemented |
 | RR2 | yes | Ch A: raw WR2; Ch B: always status-modified (datasheet behavior, independent of WR9[0] VIS) |
-| RR3 | yes | raw IP bits (Ch A only) |
+| RR3 | yes | IP bits (Ch A only); each IP gated by its enable (rev 1.2), so RR3 shows enabled-and-pending sources |
 | RR8 | yes | RX FIFO read |
 | RR10 | partial | loop-sending bit only |
 | RR12/13 | yes | BRG TC readback |
@@ -337,6 +344,8 @@ channel's TX/RX clock-enable (`tx_clk_*_s`/`rx_clk_*_s`) is forced active every
 | 20 | x32 / x64 clock-mode loopback (Ch A): WR4[7:6]=10/11 round-trip a byte, exercising the widened sample counters (reach 31/63) |
 | 21 | RTxC-from-XTAL full-rate override (WR11=0x80, RTXC_XTAL_FULLRATE_A) loopback on Ch A — byte round-trips with the engine clocked every sclk cycle |
 | 22 | Hardware reset via simultaneous /RD+/WR (RDWR_RESET_EN): programmed registers on both channels read back cleared, /INT deasserts, then a post-reset Ch A loopback proves the FIFOs/CDC recovered |
+| 23 | IP requires IE (Sun2): RX/TX/Ext IP does **not** latch with its enable off and does once enabled; TX IP also clears on a data write, then re-sets on the next byte-grab |
+| 24 | Shared WR2/WR9 via Channel B: MIE written through Ch B gates /INT for a Ch A pending int; vector (WR2) written through Ch B reads back on RR2 |
 
 (Test 11 — external x1 clock — was removed; external clock pins are tied off.)
 

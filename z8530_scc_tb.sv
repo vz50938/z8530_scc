@@ -2130,6 +2130,248 @@ initial begin
     end
 
     //------------------------------------------------------------------------
+    // Test 23: Interrupt-Pending requires Interrupt-Enable (Sun2 / NetBSD zs)
+    //   Locks in the IP<-IE coupling: an IP now latches only when its enable
+    //   bit is set, and the TX IP additionally clears when the CPU writes a
+    //   new data byte (not only via WR0 cmd 101).
+    //   A) RX IP does NOT latch with RX int disabled; latches once enabled.
+    //   B) TX IP does NOT latch with WR1[1]=0; latches once enabled.
+    //   C) TX IP clears on a data write (BRG frozen so no re-grab), then
+    //      re-sets when the engine restarts and grabs the byte.
+    //   D) Ext IP does NOT latch with WR1[0]=0; latches once enabled.
+    //------------------------------------------------------------------------
+    $display("\n[%0t] Test 23: IP requires IE (RX/TX/Ext) + TX-IP clear-on-write", $time);
+
+    begin : ip_ie_test
+        integer errs;
+        integer w;
+        reg [7:0] rb;
+        reg       got;
+        errs = 0;
+
+        // Clean Channel A, loopback @ 38400, all Ch A interrupts disabled
+        write_ctrl(1, 4'd9,  8'h80);   // Channel Reset A (flush FIFOs + int state)
+        repeat(250) @(posedge clk);
+        write_ctrl(1, 4'd4,  8'h44);   // x16, 1 stop, no parity
+        write_ctrl(1, 4'd3,  8'hC1);   // RX 8 bits, RX enable
+        write_ctrl(1, 4'd5,  8'h6A);   // TX 8 bits, TX enable, RTS
+        write_ctrl(1, 4'd12, 8'h01);   // TC=1
+        write_ctrl(1, 4'd13, 8'h00);
+        write_ctrl(1, 4'd11, 8'h50);   // clocks from BRG
+        write_ctrl(1, 4'd14, 8'h11);   // BRG + loopback
+        write_ctrl(1, 4'd1,  8'h00);   // all Ch A interrupts disabled
+        repeat(100) @(posedge clk);
+        read_ctrl(1, 4'd0, read_val);
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+
+        // ---- Sub-test A: RX IP gated by RX IE ----
+        $display("[%0t] A: RX IP gated by RX IE", $time);
+        write_data(1, 8'h5A);          // RX enabled, RX int OFF
+        got = 1'b0;
+        for (w = 0; w < 80 && !got; w = w + 1) begin
+            repeat(1000) @(posedge clk);
+            read_ctrl(1, 4'd0, read_val);
+            if (read_val[0]) got = 1'b1;   // byte landed in RX FIFO
+        end
+        read_ctrl(1, 4'd3, read_val);
+        if (got && !read_val[5])
+            $display("[%0t]   RX byte arrived, RX IP NOT set (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: RX IP with IE off (got=%b RR3=%02h)", $time, got, read_val);
+            errs = errs + 1;
+        end
+        read_ctrl(1, 4'd0, read_val);  // drain before enabling
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+        write_ctrl(1, 4'd1, 8'h10);    // WR1[4:3]=10 -> RX int on all chars
+        write_data(1, 8'hA5);
+        got = 1'b0;
+        for (w = 0; w < 80 && !got; w = w + 1) begin
+            repeat(1000) @(posedge clk);
+            read_ctrl(1, 4'd3, read_val);
+            if (read_val[5]) got = 1'b1;
+        end
+        if (got)
+            $display("[%0t]   RX IP set once RX IE on (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: RX IP not set with RX IE on (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+        write_ctrl(1, 4'd1, 8'h00);
+        read_ctrl(1, 4'd0, read_val);
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+
+        // ---- Sub-test B: TX IP gated by WR1[1] ----
+        $display("[%0t] B: TX IP gated by WR1[1]", $time);
+        write_data(1, 8'h3C);          // TX int OFF -> no TX IP
+        repeat(FRAME_WAIT_CLK) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (!read_val[4])
+            $display("[%0t]   TX IP NOT set with WR1[1]=0 (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: TX IP with WR1[1]=0 (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+        read_ctrl(1, 4'd0, read_val);
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+        write_ctrl(1, 4'd1, 8'h02);    // WR1[1] TX int enable
+        write_data(1, 8'hC3);
+        repeat(FRAME_WAIT_CLK) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (read_val[4])
+            $display("[%0t]   TX IP set once WR1[1]=1 (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: TX IP not set with WR1[1]=1 (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+
+        // ---- Sub-test C: TX IP cleared by a data write ----
+        $display("[%0t] C: TX IP cleared by data write", $time);
+        // TX IP is set (from B). Freeze the engine (BRG off) so no byte-grab can
+        // re-set it; the data write must clear TX IP on its own.
+        write_ctrl(1, 4'd14, 8'h10);   // loopback on, BRG OFF -> FSM frozen
+        repeat(60) @(posedge clk);     // let BRG-off cross into sclk (no more grabs)
+        write_data(1, 8'h99);          // the write clears TX IP
+        repeat(20) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (!read_val[4])
+            $display("[%0t]   Data write cleared TX IP (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: TX IP not cleared by data write (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+        write_ctrl(1, 4'd14, 8'h11);   // BRG back on -> grab 0x99, re-set TX IP
+        repeat(FRAME_WAIT_CLK) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (read_val[4])
+            $display("[%0t]   TX IP re-set after grab (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: TX IP not re-set after grab (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+        write_ctrl(1, 4'd0, 8'h28);    // reset TX int
+        write_ctrl(1, 4'd1, 8'h00);
+        read_ctrl(1, 4'd0, read_val);
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+
+        // ---- Sub-test D: Ext IP gated by WR1[0] ----
+        $display("[%0t] D: Ext IP gated by WR1[0]", $time);
+        ctsa_n = 1'b0;
+        write_ctrl(1, 4'd1,  8'h00);   // Ext int OFF
+        write_ctrl(1, 4'd15, 8'h20);   // CTS IE (WR15[5])
+        repeat(30) @(posedge clk);
+        write_ctrl(1, 4'd0,  8'h10);   // clear any startup ext-status pending
+        repeat(20) @(posedge clk);
+        ctsa_n = 1'b1;                 // CTS edge with Ext int OFF
+        repeat(60) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (!read_val[3])
+            $display("[%0t]   Ext IP NOT set with WR1[0]=0 (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: Ext IP with WR1[0]=0 (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+        write_ctrl(1, 4'd1, 8'h01);    // WR1[0] Ext int enable
+        write_ctrl(1, 4'd0, 8'h10);    // clear pending
+        repeat(20) @(posedge clk);
+        ctsa_n = 1'b0;                 // CTS edge with Ext int ON
+        repeat(60) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (read_val[3])
+            $display("[%0t]   Ext IP set once WR1[0]=1 (RR3=%02h) PASS", $time, read_val);
+        else begin
+            $display("[%0t]   FAIL: Ext IP not set with WR1[0]=1 (RR3=%02h)", $time, read_val);
+            errs = errs + 1;
+        end
+
+        // Cleanup
+        write_ctrl(1, 4'd15, 8'h00);
+        write_ctrl(1, 4'd1,  8'h00);
+        write_ctrl(1, 4'd0,  8'h10);
+        write_ctrl(1, 4'd14, 8'h01);   // loopback off
+        ctsa_n = 1'b0;
+        repeat(50) @(posedge clk);
+
+        if (errs == 0) $display("[%0t] IP/IE GATING TEST PASS", $time);
+        else           $display("[%0t] IP/IE GATING TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
+    end
+
+    //------------------------------------------------------------------------
+    // Test 24: WR2 / WR9 are chip-wide shared -> writable via Channel B
+    //   Datasheet: the interrupt vector (WR2) and master-int/reset control
+    //   (WR9) are shared and accessible from either channel. Sun2's driver
+    //   programs them through Channel B.
+    //   A) MIE written via Ch B gates /INT for a Ch A pending interrupt.
+    //   B) The vector base written via Ch B reads back on RR2 (Ch A, raw).
+    //------------------------------------------------------------------------
+    $display("\n[%0t] Test 24: WR2 / WR9 shared -> writable via Channel B", $time);
+
+    begin : chb_shared_regs_test
+        integer errs;
+        reg [7:0] rb;
+        errs = 0;
+
+        // ---- Sub-test A: MIE via Channel B ----
+        $display("[%0t] A: WR9/MIE via Ch B gates /INT", $time);
+        write_ctrl(1, 4'd9,  8'h80);   // Channel Reset A (clean int state)
+        repeat(250) @(posedge clk);
+        write_ctrl(1, 4'd4,  8'h44);
+        write_ctrl(1, 4'd3,  8'hC1);
+        write_ctrl(1, 4'd5,  8'h6A);
+        write_ctrl(1, 4'd12, 8'h01);
+        write_ctrl(1, 4'd13, 8'h00);
+        write_ctrl(1, 4'd11, 8'h50);
+        write_ctrl(1, 4'd14, 8'h11);   // BRG + loopback
+        write_ctrl(1, 4'd9,  8'h00);   // MIE off (via Ch A)
+        write_ctrl(1, 4'd1,  8'h02);   // TX int enable (Ch A)
+        repeat(100) @(posedge clk);
+
+        write_data(1, 8'h5A);          // -> pending TX IP
+        repeat(FRAME_WAIT_CLK) @(posedge clk);
+        read_ctrl(1, 4'd3, read_val);
+        if (read_val[4] && int_n)
+            $display("[%0t]   TX IP pending, INT_N high (MIE off) PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: precondition (RR3=%02h INT_N=%b)", $time, read_val, int_n);
+            errs = errs + 1;
+        end
+
+        write_ctrl(0, 4'd9, 8'h08);    // *** MIE via CHANNEL B ***
+        repeat(20) @(posedge clk);
+        if (!int_n)
+            $display("[%0t]   MIE write via Ch B asserted INT_N PASS", $time);
+        else begin
+            $display("[%0t]   FAIL: MIE write via Ch B had no effect (INT_N=%b)", $time, int_n);
+            errs = errs + 1;
+        end
+        write_ctrl(1, 4'd0, 8'h28);    // clear TX int
+        write_ctrl(1, 4'd9, 8'h00);    // MIE off
+        write_ctrl(1, 4'd1, 8'h00);
+        read_ctrl(1, 4'd0, read_val);
+        while (read_val[0]) begin read_data(1, read_val); read_ctrl(1, 4'd0, read_val); end
+
+        // ---- Sub-test B: vector (WR2) via Channel B ----
+        $display("[%0t] B: WR2 vector via Ch B reads back on RR2", $time);
+        write_ctrl(0, 4'd2, 8'h40);    // *** vector base via CHANNEL B ***
+        repeat(20) @(posedge clk);
+        read_ctrl(1, 4'd2, rb);        // RR2 via Ch A = raw WR2
+        if (rb == 8'h40)
+            $display("[%0t]   WR2 via Ch B -> RR2=%02h PASS", $time, rb);
+        else begin
+            $display("[%0t]   FAIL: WR2 via Ch B (RR2=%02h exp 40)", $time, rb);
+            errs = errs + 1;
+        end
+
+        // Cleanup
+        write_ctrl(1, 4'd14, 8'h01);   // loopback off
+        repeat(50) @(posedge clk);
+
+        if (errs == 0) $display("[%0t] CH-B SHARED-REG TEST PASS", $time);
+        else           $display("[%0t] CH-B SHARED-REG TEST FAIL: %0d errors", $time, errs);
+        g_fail = g_fail + errs;
+    end
+
+    //------------------------------------------------------------------------
     // Final summary. g_fail is the total number of failed checks across every
     // test (old-style tests increment it directly; named-block tests fold in
     // their local error counts). A single line makes the overall result

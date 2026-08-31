@@ -1,11 +1,16 @@
 //============================================================================
 // Z8530 SCC (Serial Communications Controller) - Synthesizable Verilog Model
 //
-// Design rev: 1.1  (2026-07-10)  -- Tests 1-22 PASS
+// Design rev: 1.2  (2026-08-31)  -- Tests 1-24 PASS
 //   Feature params: SOFT_RESET_EN, RR8_CTRL_POP, BRG_SRC_A/B,
 //     UNIPLUS_BAUD_PATCH_B, AUTO_ENABLES_EN, RTXC_XTAL_FULLRATE_A/B,
 //     RDWR_RESET_EN
 //   Rev history:
+//     1.2 - Sun2 (NetBSD/SunOS zs) interrupt fixes: an interrupt PENDING now
+//           latches only when its ENABLE is set (RX=WR1[4:3], TX=WR1[1],
+//           Ext=WR1[0]) -- matches real silicon; the TX IP also clears when the
+//           CPU writes a new data byte (not only WR0 cmd 101). Shared WR2 (vector)
+//           and WR9 (MIE/reset) are now writable via Channel B too. Tests 23-24.
 //     1.1 - Hardware reset via simultaneous /RD+/WR while selected
 //           (RDWR_RESET_EN, needs SOFT_RESET_EN) -> fires the WR9=0xC0
 //           force-reset machinery. Verified by Test 22.
