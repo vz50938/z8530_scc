@@ -1460,8 +1460,10 @@ wire status_high = wr9_a[4];
 wire rx_int_enable_a = (wr1_a[4:3] == 2'b01) || (wr1_a[4:3] == 2'b10);
 wire rx_int_enable_b = (wr1_b[4:3] == 2'b01) || (wr1_b[4:3] == 2'b10);
 
-// Gated IP -> IE views. RR3 still shows raw IPs per datasheet; only the
-// /INT output and the vector arbiter are masked by WR1[4:3]/WR1[1]/WR1[0].
+// Gated IP -> IE views, kept for the /INT output and the vector arbiter.
+// Since an IP now only latches when its enable is set, these are equal to the
+// pending bits except in the window after software clears an enable, where a
+// latched IP legitimately survives -- turning IE off does not clear an IP.
 wire rx_int_active_a  = rx_int_pend_a  & rx_int_enable_a;
 wire tx_int_active_a  = tx_int_pend_a  & wr1_a[1];
 wire ext_int_active_a = ext_int_pend_a & wr1_a[0];
@@ -1589,41 +1591,47 @@ always @(posedge clk or negedge reset_n) begin
         tx_int_pend_b <= 1'b0;
         ext_int_pend_b <= 1'b0;
     end else begin
-        // RX int (IP): latched on FIFO empty->non-empty regardless of WR1[4:3];
-        // auto-cleared when the FIFO is fully drained.
-        // The enable (WR1[4:3]) gates only the /INT output and vector arbiter.
-        if (rx_fifo_arrive_a)
+        // RX int (IP): latched on FIFO empty->non-empty *if the enable is set*;
+        // auto-cleared when the FIFO is fully drained.  An IP requires its IE
+        // on real silicon; see the note on RR3 below.
+        if (rx_fifo_arrive_a & rx_int_enable_a)
             rx_int_pend_a <= 1'b1;
         else if (rx_fifo_rempty_a)
             rx_int_pend_a <= 1'b0;
 
-        if (rx_fifo_arrive_b)
+        if (rx_fifo_arrive_b & rx_int_enable_b)
             rx_int_pend_b <= 1'b1;
         else if (rx_fifo_rempty_b)
             rx_int_pend_b <= 1'b0;
 
-        // TX int (IP): latched on TX FSM byte-grab regardless of WR1[1];
-        // cleared only by WR0 cmd 101 (Reset TX Int Pending).
-        if (reset_tx_int_cmd_a)
+        // TX int (IP): set when the buffer empties (the TX FSM grabs the byte)
+        // if WR1[1] is set, and cleared EITHER by WR0 cmd 101 (Reset TX Int
+        // Pending) OR by the CPU writing a new character -- the buffer is then
+        // no longer empty, so the condition that set it has gone.  A driver may
+        // rely on either; NetBSD's zstty_txint uses only the data write.
+        //
+        // The write wins a tie with the grab: if the FSM empties the buffer on
+        // the same clock the CPU refills it, the buffer ends up non-empty.
+        if (reset_tx_int_cmd_a | tx_fifo_wen_a)
             tx_int_pend_a <= 1'b0;
-        else if (tx_byte_grab_pulse_a)
+        else if (tx_byte_grab_pulse_a & wr1_a[1])
             tx_int_pend_a <= 1'b1;
 
-        if (reset_tx_int_cmd_b)
+        if (reset_tx_int_cmd_b | tx_fifo_wen_b)
             tx_int_pend_b <= 1'b0;
-        else if (tx_byte_grab_pulse_b)
+        else if (tx_byte_grab_pulse_b & wr1_b[1])
             tx_int_pend_b <= 1'b1;
 
-        // Ext/Status int (IP): latched on any WR15-enabled CTS/DCD edge
-        // regardless of WR1[0]; cleared only by WR0 cmd 010.
+        // Ext/Status int (IP): latched on a WR15-enabled CTS/DCD edge *if
+        // WR1[0] is set*; cleared only by WR0 cmd 010.
         if (reset_ext_int_cmd_a)
             ext_int_pend_a <= 1'b0;
-        else if (ext_int_set_a)
+        else if (ext_int_set_a & wr1_a[0])
             ext_int_pend_a <= 1'b1;
 
         if (reset_ext_int_cmd_b)
             ext_int_pend_b <= 1'b0;
-        else if (ext_int_set_b)
+        else if (ext_int_set_b & wr1_b[0])
             ext_int_pend_b <= 1'b1;
 
         // Soft-reset overrides (last assignment wins -> reset has priority).
@@ -1735,13 +1743,13 @@ always @(posedge clk or negedge reset_n) begin
                     // WR2 and WR9 are chip-wide shared registers on the real
                     // Z8530: writable through either channel. Stored as the
                     // _a copies; channel-B writes land in the same regs.
-                    //@4'd2: begin wr2_a <= data_in; reg_ptr_b <= 4'd0; end
+                    4'd2: begin wr2_a <= data_in; reg_ptr_b <= 4'd0; end
                     4'd3: begin wr3_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd4: begin wr4_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd5: begin wr5_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd6: begin wr6_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd7: begin wr7_b <= data_in; reg_ptr_b <= 4'd0; end
-                    //@4'd9: begin wr9_a <= data_in; reg_ptr_b <= 4'd0; end   // shared master-int-ctrl
+                    4'd9: begin wr9_a <= data_in; reg_ptr_b <= 4'd0; end     // shared master-int-ctrl
                     4'd10: begin wr10_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd11: begin wr11_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd12: begin wr12_b <= data_in; reg_ptr_b <= 4'd0; end
